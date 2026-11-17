@@ -1,0 +1,24 @@
+# Core
+langchain~=0.3
+langchain-community~=0.3
+langchain-core~=0.3
+langchain-openai~=0.3
+langchain-text-splitters~=0.3
+
+# Vetores
+faiss-cpu>=1.8,<2
+
+# Documentos
+pypdf>=4,<7
+
+# CLI / config
+typer>=0.12,<1
+rich>=13.7,<15
+python-dotenv>=1.0
+
+# Busca lexical (componente do retriever híbrido)
+rank-bm25>=0.2,<1
+snowballstemmer>=2.2,<3
+
+# Estimativa de tokens (--dry-run)
+tiktoken>=0.7,<1

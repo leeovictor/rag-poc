@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rag-poc"
+version = "0.1.0"
+description = "PoC de RAG híbrido (FAISS + BM25) via OpenRouter, com CLI em Typer/Rich"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "langchain~=0.3",
+    "langchain-community~=0.3",
+    "langchain-core~=0.3",
+    "langchain-openai~=0.3",
+    "langchain-text-splitters~=0.3",
+    "faiss-cpu>=1.8,<2",
+    "pypdf>=4,<7",
+    "python-dotenv>=1.0",
+    "typer>=0.12,<1",
+    "rich>=13.7,<15",
+    "rank-bm25>=0.2,<1",
+    "snowballstemmer>=2.2,<3",
+    "tiktoken>=0.7,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+rag = "rag_poc.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# Typer declara opções/argumentos como defaults de função por design.
+"src/rag_poc/cli.py" = ["B008"]
