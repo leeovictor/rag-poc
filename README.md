@@ -17,9 +17,11 @@ em português.
 - `ingest --dry-run`: estima chunks, tokens, custo de embedding, custo por
   pergunta e tempo, **sem chamar a API**.
 - `chat`: loop interativo com streaming token a token, memória dos últimos
-  turnos, reformulação de follow-ups para busca, prompt que prioriza o contexto
-  mas permite complemento com conhecimento geral (sinalizado e sem citação),
-  citação `[n]` apenas para fontes do contexto e tabela de fontes clicável.
+  turnos, planejamento da busca com **fan-out** (decompõe perguntas compostas em
+  até 3 consultas), **loop de suficiência** (busca extra quando o contexto não
+  basta), prompt que prioriza o contexto mas permite complemento com
+  conhecimento geral (sinalizado e sem citação), citações `[n]` clicáveis e
+  tabela de fontes com links.
 - `clear`: remove o índice local.
 - `status`: mostra o manifesto do índice e a configuração atual.
 - Busca híbrida configurável via `HYBRID_SEARCH` (FAISS + BM25, fundidos por
@@ -82,10 +84,11 @@ PYTHONPATH=src python -m rag_poc chat
 Dentro do `chat`, digite `sair`, `exit`, `quit` ou `Ctrl+D` para encerrar, e
 `limpar` (ou `reset`) para apagar o contexto da conversa.
 
-### Links nas fontes
+### Links nas fontes e nas citações
 
 Por padrão (`CITATION_LINK_SCHEME=vscode`), o nome do arquivo na tabela de
-fontes vira um hyperlink OSC 8: `Ctrl`/`Cmd` + clique abre no VSCode. Opções:
+fontes **e as citações `[n]` na resposta** viram hyperlinks OSC 8: `Ctrl`/`Cmd`
++ clique abre no VSCode. Opções:
 
 - `vscode`: `vscode://file/<caminho absoluto>`;
 - `file`: `file:///<caminho>` (app padrão; PDFs usam `#page=N`);
@@ -93,8 +96,9 @@ fontes vira um hyperlink OSC 8: `Ctrl`/`Cmd` + clique abre no VSCode. Opções:
 
 O link usa o caminho absoluto do `source` no índice. Arquivos ingeridos por
 caminho relativo são resolvidos a partir do diretório atual; prefira caminhos
-absolutos no `ingest`. Ainda não há link para a linha exata do chunk (o
-`start_index` do Markdown é relativo ao texto já limpo).
+absolutos no `ingest`. Citações dentro de blocos de código não são linkadas.
+Ainda não há link para a linha exata do chunk (o `start_index` do Markdown é
+relativo ao texto já limpo).
 
 ### Exemplo de sessão
 
@@ -158,6 +162,12 @@ referência (USD por 1M tokens) e podem ser ajustados em `estimation.py`.
 | `CHUNK_SIZE` | `1000` | tamanho do chunk |
 | `CHUNK_OVERLAP` | `200` | sobreposição entre chunks |
 | `RETRIEVAL_K` | `4` | trechos recuperados por pergunta |
+| `FANOUT_ENABLED` | `true` | decompõe perguntas compostas em várias consultas |
+| `FANOUT_MAX_QUERIES` | `3` | máximo de consultas por pergunta (1–6) |
+| `FANOUT_CANDIDATES_PER_QUERY` | `8` | candidatos por consulta antes da fusão |
+| `FANOUT_QUERY_LANGUAGE` | `en` | idioma das consultas geradas (`en`/`auto`) |
+| `SUFFICIENCY_MAX_ROUNDS` | `1` | rodadas extras de busca se faltar contexto (`0` desliga) |
+| `SUFFICIENCY_MAX_GAP_QUERIES` | `2` | máx. de consultas de lacuna por rodada |
 | `CHAT_MEMORY_TURNS` | `6` | turnos lembrados no chat; `0` desativa a memória |
 | `CITATION_LINK_SCHEME` | `vscode` | links nas fontes: `vscode`, `file` ou `none` |
 | `HYBRID_SEARCH` | `true` | liga/desliga o BM25 |
@@ -181,11 +191,11 @@ ingest:  arquivos ──► loaders ──► chunk_documents ──► embeddin
                                                         ▼
                                             FAISS (index.faiss/index.pkl)
                                                         │
-chat:    pergunta ──► Retriever ──► prompt LCEL ──► LLM (streaming) ──► resposta
-                        │  │
-                        │  └─ BM25 (rank_bm25, tokenização PT-BR)
+chat:    pergunta ──► planner (1..N consultas) ──► Retriever ──► prompt LCEL
+                        │  │                        └─ LLM (streaming) ──► resposta
+                        │  └─ BM25 (rank_bm25, tokenização EN)
                         └─ FAISS (similaridade)
-                        └─ fusão RRF
+                        └─ fusão RRF (por consulta e entre consultas)
 ```
 
 - `config.py`: `.env` → `Settings` validado (chave, modelos, chunking, pesos).
@@ -200,10 +210,11 @@ chat:    pergunta ──► Retriever ──► prompt LCEL ──► LLM (strea
 - `retriever.py`: FAISS + BM25 com RRF; `sources` indica `vetor`, `bm25` ou ambos.
 - `chain.py`: prompt que usa o contexto como fonte primária, permite
   complemento com conhecimento geral explicitamente sinalizado e proíbe citações
-  fora do contexto; cadeia LCEL `prompt | llm | StrOutputParser()` e chain de
-  reformulação de consulta (follow-up -> pergunta autônoma).
+  fora do contexto; cadeias LCEL para planner (fan-out) e avaliação de
+  suficiência, que gera consultas de lacuna quando o contexto não basta.
 - `memory.py`: histórico em memória limitado a `CHAT_MEMORY_TURNS`, com `limpar`.
-- `ui.py`: streaming em Markdown, tabelas e mensagens de erro.
+- `ui.py`: streaming em Markdown, citações `[n]` clicáveis, tabelas e mensagens
+  de erro.
 - `cli.py`: Typer; traduz erros da API em mensagens acionáveis.
 
 ### Por que híbrido?
@@ -243,6 +254,12 @@ Os testes usam embeddings falsos: não consomem API nem exigem chave.
 - BM25 é reconstruído em memória a cada sessão de chat (adequado para PoCs;
   para grandes corpora vale persistir o índice lexical).
 - A memória é em processo: limitada a `CHAT_MEMORY_TURNS` e perdida ao sair.
-  Cada turno com histórico faz uma chamada extra ao LLM para reformular a
-  consulta de busca (custo adicional desprezível).
+  O planner faz uma chamada curta ao LLM por turno quando o fan-out está ligado
+  (custo desprezível) e cada consulta extra gera um embedding de query.
+- O fan-out melhora cobertura de perguntas compostas, mas **não** resolve
+  consultas sem sentido: sem um gate/reranker, a busca vetorial continua
+  devolvendo vizinhos próximos para qualquer texto.
+- O loop de suficiência adiciona uma chamada curta ao LLM por turno e, quando
+  detecta lacuna, mais uma rodada de busca (limitada por
+  `SUFFICIENCY_MAX_ROUNDS`).
 - `faiss_index/` é gerado localmente e não deve ser versionado.

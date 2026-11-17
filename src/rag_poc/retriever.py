@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
@@ -24,6 +26,7 @@ class RetrievedChunk:
     document: Document
     score: float
     sources: tuple[str, ...]
+    queries: tuple[str, ...] = ()
 
 
 def _doc_key(document: Document) -> str:
@@ -76,18 +79,80 @@ class Retriever:
         return len(self._documents)
 
     def retrieve(self, query: str) -> list[RetrievedChunk]:
-        k = self._settings.retrieval_k
-        weights = self._settings.hybrid_weights if self._bm25 is not None else (1.0, 0.0)
+        return self.retrieve_many([query])
 
-        fused: dict[str, dict[str, object]] = {}
+    def retrieve_many(
+        self,
+        queries: Sequence[str],
+        *,
+        per_query_k: int | None = None,
+    ) -> list[RetrievedChunk]:
+        """Busca para cada consulta e funde os rankings por RRF.
+
+        A fusão interna de cada consulta (vetor + BM25) acontece em
+        ``_retrieve_one``; aqui aplicamos um segundo RRF entre as consultas.
+        """
+        unique_queries: list[str] = []
+        seen_queries: set[str] = set()
+        for query in queries:
+            cleaned = query.strip()
+            key = cleaned.casefold()
+            if not cleaned or key in seen_queries:
+                continue
+            seen_queries.add(key)
+            unique_queries.append(cleaned)
+
+        if not unique_queries:
+            return []
+
+        limit = self._settings.retrieval_k
+        candidates = max(
+            1,
+            per_query_k
+            if per_query_k is not None
+            else max(limit, self._settings.fanout_candidates_per_query),
+        )
+
+        fused: dict[str, dict[str, Any]] = {}
+        for query in unique_queries:
+            for rank, chunk in enumerate(self._retrieve_one(query, candidates)):
+                key = _doc_key(chunk.document)
+                entry = fused.setdefault(
+                    key,
+                    {
+                        "document": chunk.document,
+                        "score": 0.0,
+                        "sources": set(),
+                        "queries": set(),
+                    },
+                )
+                entry["score"] += 1.0 / (RRF_K + rank + 1)
+                entry["sources"].update(chunk.sources)
+                entry["queries"].add(query)
+
+        ordered = sorted(fused.values(), key=lambda entry: float(entry["score"]), reverse=True)[
+            :limit
+        ]
+
+        return [
+            RetrievedChunk(
+                document=entry["document"],
+                score=float(entry["score"]),
+                sources=tuple(source for source in _SOURCE_ORDER if source in entry["sources"]),
+                queries=tuple(query for query in unique_queries if query in entry["queries"]),
+            )
+            for entry in ordered
+        ]
+
+    def _retrieve_one(self, query: str, k: int) -> list[RetrievedChunk]:
+        weights = self._settings.hybrid_weights if self._bm25 is not None else (1.0, 0.0)
+        fused: dict[str, dict[str, Any]] = {}
 
         def register(document: Document, weight: float, source: str) -> None:
             key = _doc_key(document)
             entry = fused.setdefault(key, {"document": document, "score": 0.0, "sources": set()})
             entry["score"] = float(entry["score"]) + weight
-            sources = entry["sources"]
-            assert isinstance(sources, set)
-            sources.add(source)
+            entry["sources"].add(source)
 
         vector_hits = self._store.similarity_search_with_score(query, k=k)
         for rank, (document, _distance) in enumerate(vector_hits):
@@ -115,13 +180,9 @@ class Retriever:
 
         return [
             RetrievedChunk(
-                document=entry["document"],  # type: ignore[arg-type]
+                document=entry["document"],
                 score=float(entry["score"]),
-                sources=tuple(
-                    source
-                    for source in _SOURCE_ORDER
-                    if source in entry["sources"]  # type: ignore[operator]
-                ),
+                sources=tuple(source for source in _SOURCE_ORDER if source in entry["sources"]),
             )
             for entry in ordered
         ]

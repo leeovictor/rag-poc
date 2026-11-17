@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Sequence
 
 from rich.console import Console
@@ -52,11 +53,21 @@ def chat_intro(settings: Settings, hybrid_enabled: bool) -> None:
     links = (
         "desativados" if settings.citation_link_scheme == "none" else settings.citation_link_scheme
     )
+    fanout = (
+        f"até {settings.fanout_max_queries} consulta(s)"
+        if settings.fanout_enabled
+        else "desativado"
+    )
+    sufficiency = (
+        "desligada"
+        if settings.sufficiency_max_rounds <= 0
+        else f"{settings.sufficiency_max_rounds} rodada(s)"
+    )
     console.print(
         Panel(
             f"Modelo: [bold]{settings.llm_model}[/]\n"
-            f"Busca: {mode} · k={settings.retrieval_k} · memória: {memory} "
-            f"· links: {links}\n"
+            f"Busca: {mode} · k={settings.retrieval_k} · memória: {memory}\n"
+            f"Fan-out: {fanout} · suficiência: {sufficiency} · links: {links}\n"
             "Pergunte, use [bold]limpar[/] para apagar o contexto, ou [bold]sair[/] / Ctrl+D.",
             title="[bold cyan]RAG Híbrido[/]",
             border_style="cyan",
@@ -73,8 +84,54 @@ def ask_question() -> str | None:
         return None
 
 
-def stream_answer(stream: Iterable[str]) -> str:
-    """Renderiza a resposta token a token em Markdown e devolve o texto final."""
+_CITATION_LINK_RE = re.compile(r"\[(\d+)\](?!\()")
+_FENCE_BLOCK_RE = re.compile(r"(```.*?```)", re.DOTALL)
+
+
+def linkify_citations(
+    text: str,
+    chunks: Sequence[RetrievedChunk],
+    link_scheme: str,
+) -> str:
+    """Transforma `[n]` em link Markdown para o arquivo da fonte, fora de code blocks."""
+    if link_scheme == "none" or not chunks or "[" not in text:
+        return text
+
+    links: dict[str, str] = {}
+    for position, chunk in enumerate(chunks, start=1):
+        document = chunk.document
+        source = str(document.metadata.get("source") or "")
+        page = document.metadata.get("page")
+        link = build_source_link(source, link_scheme, page if isinstance(page, int) else None)
+        if link is not None:
+            links[str(position)] = link
+
+    if not links:
+        return text
+
+    def replace(match: re.Match[str]) -> str:
+        number = match.group(1)
+        url = links.get(number)
+        if url is None:
+            return match.group(0)
+        return f"[[{number}]]({url})"
+
+    parts = _FENCE_BLOCK_RE.split(text)
+    for index in range(0, len(parts), 2):
+        parts[index] = _CITATION_LINK_RE.sub(replace, parts[index])
+    return "".join(parts)
+
+
+def stream_answer(
+    stream: Iterable[str],
+    *,
+    chunks: Sequence[RetrievedChunk] | None = None,
+    link_scheme: str = "none",
+) -> str:
+    """Renderiza a resposta token a token em Markdown e devolve o texto final.
+
+    O retorno é o texto bruto (sem links) para memória e extração de citações.
+    """
     text = ""
     with Live(
         Markdown(""),
@@ -84,7 +141,7 @@ def stream_answer(stream: Iterable[str]) -> str:
     ) as live:
         for delta in stream:
             text += delta
-            live.update(Markdown(text))
+            live.update(Markdown(linkify_citations(text, chunks or [], link_scheme)))
     return text
 
 
@@ -108,6 +165,9 @@ def print_sources(
     table.add_column("Página", justify="right")
     table.add_column("Via", justify="center")
     table.add_column("Citada", justify="center")
+    show_queries = any(len(chunk.queries) > 1 for chunk in chunks)
+    if show_queries:
+        table.add_column("Subconsultas", justify="center")
 
     for position, chunk in enumerate(chunks, start=1):
         document = chunk.document
@@ -123,13 +183,16 @@ def print_sources(
             name_text.stylize(f"link {link}")
             name_text.stylize("underline")
 
-        table.add_row(
+        row: list[object] = [
             str(position),
             name_text,
             page_label,
             _via_label(chunk),
             "[green]sim[/]" if position in cited else _PAGE_DASH,
-        )
+        ]
+        if show_queries:
+            row.append(str(len(chunk.queries)) if chunk.queries else _PAGE_DASH)
+        table.add_row(*row)
 
     console.print(table)
 
@@ -138,8 +201,24 @@ def print_rewritten_query(query: str) -> None:
     console.print(f"[dim]Busca reformulada:[/] {escape(query)}")
 
 
-def print_condense_fallback() -> None:
-    console.print("[dim]Não foi possível reformular a pergunta; usando a original na busca.[/]")
+def print_queries(queries: Sequence[str]) -> None:
+    joined = " · ".join(escape(query) for query in queries)
+    console.print(f"[dim]Consultas ({len(queries)}):[/] {joined}")
+
+
+def print_planner_fallback() -> None:
+    console.print(
+        "[dim]Não foi possível planejar as consultas; usando a pergunta original na busca.[/]"
+    )
+
+
+def print_sufficiency_fallback() -> None:
+    console.print("[dim]Verificação de suficiência indisponível; seguindo com o contexto atual.[/]")
+
+
+def print_gap(missing: str, queries: Sequence[str]) -> None:
+    detail = f" ({escape(missing)})" if missing else ""
+    console.print(f"[yellow]Lacuna detectada{detail}:[/] +{len(queries)} consulta(s) de busca.")
 
 
 def print_no_results(question: str, indexed_chunks: int) -> None:

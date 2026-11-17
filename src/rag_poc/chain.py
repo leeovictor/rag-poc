@@ -1,9 +1,11 @@
-"""Prompts, reformulação de consulta e cadeias LCEL do chat."""
+"""Prompts, planejamento de consultas e cadeias LCEL do chat."""
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from langchain_core.messages import BaseMessage
@@ -47,26 +49,71 @@ HUMAN_PROMPT = """CONTEXTO:
 PERGUNTA:
 {question}"""
 
-CONDENSE_SYSTEM_PROMPT = """Você reescreve follow-ups em uma consulta de busca autônoma.
+PLANNER_SYSTEM_PROMPT = """Você planeja consultas de busca para uma base de documentos.
+
+Receba o HISTÓRICO da conversa e a PERGUNTA ATUAL.
 
 Regras:
-- Resolva pronomes e referências ("isso", "ele", "o hook acima") usando o HISTÓRICO.
+- Resolva pronomes e referências usando o histórico.
 - Preserve nomes técnicos (hooks, APIs, componentes) exatamente como aparecem.
-- Não responda à pergunta e não invente informação nova.
-- Se a pergunta já for autônoma, repita-a.
-- Retorne SOMENTE a consulta reescrita, em uma única linha."""
+- A primeira consulta deve ser a pergunta atual reescrita de forma autônoma.
+- Se a pergunta for simples, retorne apenas essa consulta principal.
+- Se a pergunta for composta, comparativa ou tiver várias partes, adicione
+  consultas independentes para os subtópicos, até o limite.
+- Gere no máximo {max_queries} consultas no total.
+- {language_instruction}
+- Não responda à pergunta e não invente tópicos que ela não sugere.
+- Retorne SOMENTE um objeto JSON com a chave "queries" e uma lista de strings.
+  Sem markdown, sem explicação e sem texto fora do JSON."""
 
-CONDENSE_HUMAN_PROMPT = """HISTÓRICO:
+PLANNER_HUMAN_PROMPT = """HISTÓRICO:
 {history}
 
-ÚLTIMA PERGUNTA:
+PERGUNTA ATUAL:
 {question}
 
-CONSULTA AUTÔNOMA:"""
+CONSULTAS:"""
+
+SUFFICIENCY_SYSTEM_PROMPT = """Você avalia se o CONTEXTO recuperado basta para responder à PERGUNTA.
+
+Regras:
+- Considere suficiente quando o contexto permite responder à pergunta principal,
+  mesmo sem cobrir todos os detalhes.
+- Só marque insuficiente se faltar um tópico essencial da pergunta. Não peça
+  mais buscas por detalhes que já podem ser explicados com o contexto atual.
+- Se a pergunta for simples e o contexto for relacionado, prefira suficiente.
+- Gere no máximo {max_gap_queries} consultas de lacuna.
+- {language_instruction}
+- Preserve nomes técnicos (hooks, APIs, componentes).
+- Não responda à pergunta.
+- Retorne SOMENTE um objeto JSON com as chaves "sufficient" (booleano),
+  "missing" (string curta) e "queries" (lista de strings)."""
+
+SUFFICIENCY_HUMAN_PROMPT = """HISTÓRICO:
+{history}
+
+PERGUNTA:
+{question}
+
+CONTEXTO:
+{context}
+
+AVALIAÇÃO:"""
 
 _CITATION_RE = re.compile(r"\[(\d+)\]")
 _MAX_CONDENSED_QUERY_CHARS = 500
 EMPTY_CONTEXT_PLACEHOLDER = "(nenhum trecho recuperado)"
+_LANGUAGE_INSTRUCTIONS = {
+    "en": "Escreva cada consulta em inglês, pois a base de documentos está em inglês.",
+    "auto": "Escreva cada consulta no mesmo idioma da pergunta.",
+}
+
+
+@dataclass(frozen=True)
+class SufficiencyResult:
+    sufficient: bool
+    missing: str
+    queries: list[str]
 
 
 def build_prompt() -> ChatPromptTemplate:
@@ -80,12 +127,17 @@ def build_prompt() -> ChatPromptTemplate:
     )
 
 
-def build_condense_prompt() -> ChatPromptTemplate:
-    return ChatPromptTemplate.from_messages(
+def build_planner_prompt(max_queries: int, language: str) -> ChatPromptTemplate:
+    """Prompt que transforma a pergunta em 1..N consultas de busca."""
+    prompt = ChatPromptTemplate.from_messages(
         [
-            ("system", CONDENSE_SYSTEM_PROMPT),
-            ("human", CONDENSE_HUMAN_PROMPT),
+            ("system", PLANNER_SYSTEM_PROMPT),
+            ("human", PLANNER_HUMAN_PROMPT),
         ]
+    )
+    return prompt.partial(
+        max_queries=max_queries,
+        language_instruction=_LANGUAGE_INSTRUCTIONS.get(language, _LANGUAGE_INSTRUCTIONS["auto"]),
     )
 
 
@@ -118,30 +170,190 @@ def build_answer_chain(settings: Settings) -> Runnable[dict[str, Any], str]:
     return build_prompt() | build_llm(settings) | StrOutputParser()
 
 
-def build_condense_chain(settings: Settings) -> Runnable[dict[str, Any], str]:
-    """Cadeia LCEL que transforma o follow-up em consulta de busca autônoma."""
-    return build_condense_prompt() | build_llm(settings) | StrOutputParser()
+def build_planner_chain(
+    settings: Settings, max_queries: int | None = None
+) -> Runnable[dict[str, Any], str]:
+    """Cadeia LCEL que reformula e decompõe a pergunta em consultas."""
+    limit = max_queries
+    if limit is None:
+        limit = settings.fanout_max_queries if settings.fanout_enabled else 1
+    return (
+        build_planner_prompt(max(1, limit), settings.fanout_query_language)
+        | build_llm(settings)
+        | StrOutputParser()
+    )
 
 
-def condense_question(
-    chain: Runnable[dict[str, Any], str], question: str, history_text: str
-) -> str:
-    """Reescreve o follow-up; em caso de saída vazia, mantém a pergunta original."""
-    if not history_text.strip():
-        return question
+def _strip_code_fences(text: str) -> str:
+    text = text.strip()
+    if not text.startswith("```"):
+        return text
+    lines = text.splitlines()
+    if lines and lines[0].strip().startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip().startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
 
-    raw = chain.invoke({"history": history_text, "question": question})
-    condensed = raw.strip().strip("\"'")
-    lower = condensed.lower()
-    for prefix in ("consulta autônoma:", "consulta autonoma:", "query:"):
-        if lower.startswith(prefix):
-            condensed = condensed[len(prefix) :].strip()
+
+def _load_json(raw: str) -> object | None:
+    text = _strip_code_fences(raw)
+    candidates = [text]
+    for opener, closer in (("{", "}"), ("[", "]")):
+        start = text.find(opener)
+        end = text.rfind(closer)
+        if start != -1 and end > start:
+            candidates.append(text[start : end + 1])
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return None
+
+
+def _clean_query(value: str) -> str:
+    text = value.strip().strip("\"'").strip()
+    text = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", text)
+    text = " ".join(text.split())
+    return text[:_MAX_CONDENSED_QUERY_CHARS].rstrip()
+
+
+def _queries_from_payload(payload: object) -> list[str]:
+    values: object | None = None
+    if isinstance(payload, dict):
+        values = payload.get("queries")
+    elif isinstance(payload, list):
+        values = payload
+    if not isinstance(values, list):
+        return []
+    return [value for value in values if isinstance(value, str)]
+
+
+def parse_queries(raw: str, max_queries: int) -> list[str]:
+    """Extrai e sanitiza as consultas da resposta do planejador."""
+    values = _queries_from_payload(_load_json(raw))
+    if not values:
+        text = _strip_code_fences(raw)
+        lines = [line for line in text.splitlines() if line.strip()]
+        looks_like_list = len(lines) > 1 or any(
+            re.match(r"^\s*(?:[-*•]|\d+[.)])\s+", line) for line in lines
+        )
+        if looks_like_list:
+            values = [line for line in lines if not line.strip().startswith(("{", "}", "["))]
+
+    queries: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        query = _clean_query(value)
+        key = query.casefold()
+        if not query or key in seen:
+            continue
+        seen.add(key)
+        queries.append(query)
+        if len(queries) >= max(1, max_queries):
             break
+    return queries
 
-    first_line = condensed.splitlines()[0].strip() if condensed else ""
-    if not first_line:
-        return question
-    return first_line[:_MAX_CONDENSED_QUERY_CHARS].rstrip()
+
+def build_sufficiency_prompt(max_gap_queries: int, language: str) -> ChatPromptTemplate:
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", SUFFICIENCY_SYSTEM_PROMPT),
+            ("human", SUFFICIENCY_HUMAN_PROMPT),
+        ]
+    )
+    return prompt.partial(
+        max_gap_queries=max_gap_queries,
+        language_instruction=_LANGUAGE_INSTRUCTIONS.get(language, _LANGUAGE_INSTRUCTIONS["auto"]),
+    )
+
+
+def build_sufficiency_chain(settings: Settings) -> Runnable[dict[str, Any], str]:
+    """Cadeia LCEL que avalia se o contexto atual é suficiente."""
+    return (
+        build_sufficiency_prompt(
+            settings.sufficiency_max_gap_queries, settings.fanout_query_language
+        )
+        | build_llm(settings)
+        | StrOutputParser()
+    )
+
+
+def parse_sufficiency(raw: str, max_gap_queries: int) -> SufficiencyResult:
+    """Interpreta a avaliação; formato inválido é tratado como suficiente."""
+    payload = _load_json(raw)
+    if not isinstance(payload, dict):
+        return SufficiencyResult(sufficient=True, missing="", queries=[])
+
+    sufficient = payload.get("sufficient")
+    if isinstance(sufficient, str):
+        sufficient = sufficient.strip().lower() in {"true", "sim", "yes", "1"}
+    if not isinstance(sufficient, bool):
+        sufficient = True
+
+    missing = str(payload.get("missing") or "").strip()[:300]
+
+    queries: list[str] = []
+    seen: set[str] = set()
+    raw_queries = payload.get("queries")
+    if isinstance(raw_queries, list):
+        for value in raw_queries:
+            if not isinstance(value, str):
+                continue
+            query = _clean_query(value)
+            key = query.casefold()
+            if not query or key in seen:
+                continue
+            seen.add(key)
+            queries.append(query)
+            if len(queries) >= max(1, max_gap_queries):
+                break
+
+    return SufficiencyResult(sufficient=sufficient, missing=missing, queries=queries)
+
+
+def check_sufficiency(
+    chain: Runnable[dict[str, Any], str],
+    question: str,
+    history_text: str,
+    chunks: Sequence[RetrievedChunk],
+    max_gap_queries: int,
+) -> SufficiencyResult:
+    raw = chain.invoke(
+        {
+            "history": history_text.strip() or "(sem histórico)",
+            "question": question,
+            "context": format_context(chunks) or EMPTY_CONTEXT_PLACEHOLDER,
+        }
+    )
+    return parse_sufficiency(raw, max_gap_queries)
+
+
+def merge_queries(existing: Sequence[str], extra: Sequence[str]) -> list[str]:
+    """Une consultas preservando a ordem e removendo duplicatas (case-insensitive)."""
+    merged = list(existing)
+    seen = {query.casefold() for query in merged}
+    for query in extra:
+        cleaned = query.strip()
+        key = cleaned.casefold()
+        if not cleaned or key in seen:
+            continue
+        seen.add(key)
+        merged.append(cleaned)
+    return merged
+
+
+def plan_queries(
+    chain: Runnable[dict[str, Any], str],
+    question: str,
+    history_text: str,
+    max_queries: int,
+) -> list[str]:
+    """Reescreve/decompõe a pergunta; em falha de formato, usa a pergunta original."""
+    raw = chain.invoke({"history": history_text.strip() or "(sem histórico)", "question": question})
+    queries = parse_queries(raw, max_queries)
+    return queries or [question]
 
 
 def stream_answer(

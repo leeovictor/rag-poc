@@ -128,6 +128,12 @@ class Settings:
     app_url: str
     app_name: str
     citation_link_scheme: str = "vscode"
+    fanout_enabled: bool = True
+    fanout_max_queries: int = 3
+    fanout_candidates_per_query: int = 8
+    fanout_query_language: str = "en"
+    sufficiency_max_rounds: int = 1
+    sufficiency_max_gap_queries: int = 2
     chat_memory_turns: int = 6
     warnings: tuple[str, ...] = ()
 
@@ -175,6 +181,19 @@ class Settings:
                 f"{permitidos} (recebido: {citation_link_scheme!r})."
             )
 
+        fanout_max_queries = _int("FANOUT_MAX_QUERIES", 3, minimum=1)
+        if fanout_max_queries > 6:
+            raise SettingsError(
+                f"FANOUT_MAX_QUERIES deve ser <= 6 (recebido: {fanout_max_queries})."
+            )
+
+        fanout_query_language = _string("FANOUT_QUERY_LANGUAGE", "en").lower()
+        if fanout_query_language not in {"en", "auto"}:
+            raise SettingsError(
+                "FANOUT_QUERY_LANGUAGE deve ser 'en' ou 'auto' "
+                f"(recebido: {fanout_query_language!r})."
+            )
+
         return cls(
             openrouter_api_key=api_key,
             openrouter_base_url=_string("OPENROUTER_BASE_URL", DEFAULT_BASE_URL).rstrip("/"),
@@ -192,6 +211,12 @@ class Settings:
             app_url=_string("APP_URL", "http://localhost"),
             app_name=_string("APP_NAME", "rag-poc"),
             citation_link_scheme=citation_link_scheme,
+            fanout_enabled=_bool("FANOUT_ENABLED", True),
+            fanout_max_queries=fanout_max_queries,
+            fanout_candidates_per_query=_int("FANOUT_CANDIDATES_PER_QUERY", 8, minimum=1),
+            fanout_query_language=fanout_query_language,
+            sufficiency_max_rounds=_int("SUFFICIENCY_MAX_ROUNDS", 1, minimum=0),
+            sufficiency_max_gap_queries=_int("SUFFICIENCY_MAX_GAP_QUERIES", 2, minimum=1),
             chat_memory_turns=_int("CHAT_MEMORY_TURNS", 6, minimum=0),
             warnings=tuple(warnings),
         )

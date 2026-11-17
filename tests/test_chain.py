@@ -4,11 +4,17 @@ from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, HumanMessage
 
 from rag_poc.chain import (
-    build_condense_prompt,
+    SufficiencyResult,
+    build_planner_prompt,
     build_prompt,
-    condense_question,
+    build_sufficiency_prompt,
+    check_sufficiency,
     extract_citations,
     format_context,
+    merge_queries,
+    parse_queries,
+    parse_sufficiency,
+    plan_queries,
 )
 from rag_poc.retriever import RetrievedChunk
 
@@ -72,48 +78,141 @@ def test_prompt_includes_history_between_system_and_question() -> None:
     assert messages[-1].content.startswith("CONTEXTO:")
 
 
-def test_condense_prompt_keeps_rewrite_rules() -> None:
-    messages = build_condense_prompt().format_messages(
+def test_planner_prompt_includes_limit_language_and_json_rule() -> None:
+    messages = build_planner_prompt(3, "en").format_messages(
         history="Usuário: o que é useEffect?", question="e o cleanup?"
     )
 
     system = messages[0].content
     assert isinstance(system, str)
-    assert "SOMENTE a consulta reescrita" in system
+    assert "no máximo 3 consultas" in system
+    assert "inglês" in system
+    assert "JSON" in system
     assert "Não responda" in system
+    assert messages[1].content.startswith("HISTÓRICO:")
+
+
+def test_parse_queries_json() -> None:
+    assert parse_queries('{"queries": ["a", "b"]}', 3) == ["a", "b"]
+
+
+def test_parse_queries_fenced_json() -> None:
+    raw = '```json\n{"queries": ["useState", "cleanup timing"]}\n```'
+
+    assert parse_queries(raw, 3) == ["useState", "cleanup timing"]
+
+
+def test_parse_queries_plain_lines_fallback() -> None:
+    assert parse_queries("- useState\n- cleanup timing", 3) == [
+        "useState",
+        "cleanup timing",
+    ]
+
+
+def test_parse_queries_dedupes_and_clamps() -> None:
+    raw = '{"queries": ["A", "a", "b", "c", "d"]}'
+
+    assert parse_queries(raw, 3) == ["A", "b", "c"]
+
+
+def test_parse_queries_cleans_bullets_and_numbers() -> None:
+    raw = '{"queries": ["- useState initial value", "2) cleanup timing"]}'
+
+    assert parse_queries(raw, 3) == ["useState initial value", "cleanup timing"]
+
+
+def test_parse_queries_invalid_returns_empty() -> None:
+    assert parse_queries("desculpe, não sei responder.", 3) == []
 
 
 class _FakeChain:
     def __init__(self, output: str) -> None:
         self.output = output
+        self.payloads: list[dict] = []
 
     def invoke(self, payload: dict) -> str:
+        self.payloads.append(payload)
         return self.output
 
 
-class _ExplodingChain:
-    def invoke(self, payload: dict) -> str:
-        raise AssertionError("não deveria chamar o LLM sem histórico")
+def test_plan_queries_invokes_chain_with_history() -> None:
+    chain = _FakeChain('{"queries": ["When does useEffect cleanup run?"]}')
+
+    queries = plan_queries(chain, "e quando ele roda?", "Usuário: o que é useEffect?", 3)
+
+    assert queries == ["When does useEffect cleanup run?"]
+    assert chain.payloads[0]["question"] == "e quando ele roda?"
+    assert "Usuário: o que é useEffect?" in chain.payloads[0]["history"]
 
 
-def test_condense_question_sanitizes_output() -> None:
-    chain = _FakeChain('  "useEffect cleanup function"  ')
+def test_plan_queries_falls_back_to_original_on_invalid_output() -> None:
+    assert plan_queries(_FakeChain("desculpe"), "pergunta", "histórico", 3) == ["pergunta"]
 
-    assert (
-        condense_question(chain, "e isso?", "Usuário: o que é useEffect?")
-        == "useEffect cleanup function"
+
+def test_sufficiency_prompt_includes_limit_language_and_json_rule() -> None:
+    messages = build_sufficiency_prompt(2, "en").format_messages(
+        history="(sem histórico)",
+        question="pergunta",
+        context="[1] trecho",
     )
 
-
-def test_condense_question_strips_prefix_and_keeps_first_line() -> None:
-    chain = _FakeChain("Consulta autônoma: useState initial value\nignorar")
-
-    assert condense_question(chain, "e o valor inicial?", "histórico") == "useState initial value"
-
-
-def test_condense_question_falls_back_on_empty_output() -> None:
-    assert condense_question(_FakeChain("   "), "pergunta", "histórico") == "pergunta"
+    system = messages[0].content
+    assert isinstance(system, str)
+    assert "no máximo 2 consultas" in system
+    assert "inglês" in system
+    assert "JSON" in system
+    assert "Não responda" in system
 
 
-def test_condense_question_skips_llm_without_history() -> None:
-    assert condense_question(_ExplodingChain(), "pergunta", "") == "pergunta"
+def test_parse_sufficiency_sufficient() -> None:
+    result = parse_sufficiency({"sufficient": True, "missing": "", "queries": []}.__repr__(), 2)
+    # repr não é JSON; formato inválido deve ser tratado como suficiente
+    assert result == SufficiencyResult(sufficient=True, missing="", queries=[])
+
+
+def test_parse_sufficiency_false_with_queries() -> None:
+    raw = (
+        '{"sufficient": false, "missing": "como o cleanup roda", '
+        '"queries": ["cleanup timing", "cleanup dependencies"]}'
+    )
+
+    result = parse_sufficiency(raw, 2)
+
+    assert result.sufficient is False
+    assert result.missing == "como o cleanup roda"
+    assert result.queries == ["cleanup timing", "cleanup dependencies"]
+
+
+def test_parse_sufficiency_caps_and_dedupes_queries() -> None:
+    raw = '{"sufficient": false, "queries": ["a", "A", "b", "c"]}'
+
+    assert parse_sufficiency(raw, 2).queries == ["a", "b"]
+
+
+def test_parse_sufficiency_invalid_is_treated_as_sufficient() -> None:
+    result = parse_sufficiency("desculpe, não consigo avaliar", 2)
+
+    assert result.sufficient is True
+    assert result.queries == []
+
+
+def test_check_sufficiency_passes_context_and_history() -> None:
+    chain = _FakeChain('{"sufficient": true, "missing": "", "queries": []}')
+
+    result = check_sufficiency(
+        chain,
+        question="e quando roda?",
+        history_text="Usuário: o que é useEffect?",
+        chunks=[make_chunk("a", "useEffect cleanup runs after render")],
+        max_gap_queries=2,
+    )
+
+    payload = chain.payloads[0]
+    assert payload["question"] == "e quando roda?"
+    assert "Usuário: o que é useEffect?" in payload["history"]
+    assert "[1] a.txt" in payload["context"]
+    assert result.sufficient is True
+
+
+def test_merge_queries_preserves_order_and_dedupes() -> None:
+    assert merge_queries(["A", "b"], ["a", "C"]) == ["A", "b", "C"]

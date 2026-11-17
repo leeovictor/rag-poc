@@ -3,9 +3,11 @@ from __future__ import annotations
 from dataclasses import replace
 from unittest.mock import patch
 
+import openai
 from langchain_core.documents import Document
 
 from rag_poc import cli, ui
+from rag_poc.chain import SufficiencyResult
 from rag_poc.retriever import RetrievedChunk
 
 
@@ -17,6 +19,7 @@ def _chunk() -> RetrievedChunk:
         ),
         score=1.0,
         sources=("vetor",),
+        queries=("useState",),
     )
 
 
@@ -29,25 +32,20 @@ class _FakeAnswerChain:
         return iter(["resposta"])
 
 
-class _FakeCondenseChain:
-    def __init__(self) -> None:
-        self.calls: list[dict] = []
-
-    def invoke(self, payload: dict) -> str:
-        self.calls.append(payload)
-        return "useState initial value"
-
-
 class _FakeRetriever:
     hybrid_enabled = False
     document_count = 1
 
-    def __init__(self) -> None:
-        self.queries: list[str] = []
+    def __init__(self, chunks: list[RetrievedChunk] | None = None) -> None:
+        self.calls: list[list[str]] = []
+        self._chunks = chunks if chunks is not None else [_chunk()]
+
+    def retrieve_many(self, queries: list[str]) -> list[RetrievedChunk]:
+        self.calls.append(list(queries))
+        return self._chunks
 
     def retrieve(self, query: str) -> list[RetrievedChunk]:
-        self.queries.append(query)
-        return [_chunk()]
+        return self.retrieve_many([query])
 
 
 def _question_provider(questions: list[str]):
@@ -59,155 +57,277 @@ def _question_provider(questions: list[str]):
     return ask
 
 
-def _run_chat(monkeypatch, settings, questions: list[str]):
-    fake_answer = _FakeAnswerChain()
-    fake_condense = _FakeCondenseChain()
-    fake_retriever = _FakeRetriever()
-    rewritten: list[str] = []
+class _Records:
+    def __init__(self) -> None:
+        self.answer = _FakeAnswerChain()
+        self.retriever = _FakeRetriever()
+        self.planner_calls: list[dict] = []
+        self.rewritten: list[str] = []
+        self.printed_queries: list[list[str]] = []
+        self.fallbacks = 0
+        self.no_results: list[tuple[str, int]] = []
+        self.check_calls: list[dict] = []
+        self.gaps: list[tuple[str, list[str]]] = []
+        self.sufficiency_fallbacks = 0
+
+
+def _run_chat(
+    monkeypatch,
+    settings,
+    questions: list[str],
+    *,
+    plan=None,
+    sufficiency=None,
+    records: _Records | None = None,
+    planner_error: bool = False,
+    sufficiency_error: bool = False,
+    settings_override=None,
+):
+    records = records or _Records()
+
+    def default_plan(question: str, history: str) -> list[str]:
+        return [question]
+
+    plan_fn = plan or default_plan
+
+    def default_sufficiency(question: str, history: str, chunks: list) -> SufficiencyResult:
+        return SufficiencyResult(sufficient=True, missing="", queries=[])
+
+    sufficiency_fn = sufficiency or default_sufficiency
+
+    def fake_check(chain, question, history, chunks, max_gap_queries):
+        records.check_calls.append(
+            {
+                "question": question,
+                "history": history,
+                "chunks": list(chunks),
+                "max_gap_queries": max_gap_queries,
+            }
+        )
+        if sufficiency_error:
+            raise openai.APIConnectionError(request=None)  # type: ignore[arg-type]
+        return sufficiency_fn(question, history, list(chunks))
+
+    def fail_or_plan(chain, question: str, history: str, max_queries: int) -> list[str]:
+        records.planner_calls.append(
+            {"question": question, "history": history, "max_queries": max_queries}
+        )
+        if planner_error:
+            raise openai.APIConnectionError(request=None)  # type: ignore[arg-type]
+        return plan_fn(question, history)
 
     monkeypatch.setattr(ui, "ask_question", _question_provider(questions))
     monkeypatch.setattr(ui, "chat_intro", lambda *args, **kwargs: None)
-    monkeypatch.setattr(ui, "stream_answer", lambda stream: "resposta")
+    monkeypatch.setattr(ui, "stream_answer", lambda stream, **kwargs: "resposta")
     monkeypatch.setattr(ui, "print_sources", lambda *args, **kwargs: None)
-    monkeypatch.setattr(ui, "print_rewritten_query", rewritten.append)
-    monkeypatch.setattr(ui, "print_condense_fallback", lambda: None)
+    monkeypatch.setattr(ui, "print_rewritten_query", records.rewritten.append)
+    monkeypatch.setattr(ui, "print_queries", records.printed_queries.append)
+    monkeypatch.setattr(
+        ui, "print_planner_fallback", lambda: setattr(records, "fallbacks", records.fallbacks + 1)
+    )
+    monkeypatch.setattr(
+        ui,
+        "print_no_results",
+        lambda question, count: records.no_results.append((question, count)),
+    )
+    monkeypatch.setattr(
+        ui,
+        "print_gap",
+        lambda missing, queries: records.gaps.append((missing, list(queries))),
+    )
+    monkeypatch.setattr(
+        ui,
+        "print_sufficiency_fallback",
+        lambda: setattr(
+            records,
+            "sufficiency_fallbacks",
+            records.sufficiency_fallbacks + 1,
+        ),
+    )
 
-    test_settings = replace(settings, chat_memory_turns=2)
+    test_settings = settings_override or replace(settings, chat_memory_turns=2)
 
     with (
         patch.object(cli.Settings, "from_env", return_value=test_settings),
-        patch.object(cli.Retriever, "build", return_value=fake_retriever),
-        patch.object(cli, "build_answer_chain", return_value=fake_answer),
-        patch.object(cli, "build_condense_chain", return_value=fake_condense),
+        patch.object(cli.Retriever, "build", return_value=records.retriever),
+        patch.object(cli, "build_answer_chain", return_value=records.answer),
+        patch.object(cli, "build_planner_chain", return_value=object()),
+        patch.object(cli, "plan_queries", side_effect=fail_or_plan),
+        patch.object(cli, "build_sufficiency_chain", return_value=object()),
+        patch.object(cli, "check_sufficiency", side_effect=fake_check),
     ):
         cli.chat(k=None, show_chunks=False, debug=False)
 
-    return fake_answer, fake_condense, fake_retriever, rewritten
+    return records
 
 
 def test_chat_persists_history_and_rewrites_followup(monkeypatch, settings) -> None:
-    fake_answer, fake_condense, fake_retriever, rewritten = _run_chat(
-        monkeypatch, settings, ["o que é useState?", "e o valor inicial?", "sair"]
+    records = _run_chat(
+        monkeypatch,
+        settings,
+        ["o que é useState?", "e o valor inicial?", "sair"],
+        plan=lambda question, history: (
+            ["useState initial value"] if question == "e o valor inicial?" else [question]
+        ),
     )
 
-    assert [payload["question"] for payload in fake_answer.inputs] == [
+    assert [payload["question"] for payload in records.answer.inputs] == [
         "o que é useState?",
         "e o valor inicial?",
     ]
-    assert fake_answer.inputs[0]["history"] == []
-    assert [message.content for message in fake_answer.inputs[1]["history"]] == [
+    assert records.answer.inputs[0]["history"] == []
+    assert [message.content for message in records.answer.inputs[1]["history"]] == [
         "o que é useState?",
         "resposta",
     ]
 
-    assert len(fake_condense.calls) == 1
-    assert fake_condense.calls[0]["question"] == "e o valor inicial?"
-    assert "Usuário: o que é useState?" in fake_condense.calls[0]["history"]
-    assert fake_retriever.queries == ["o que é useState?", "useState initial value"]
-    assert rewritten == ["useState initial value"]
+    assert len(records.planner_calls) == 2
+    assert records.planner_calls[1]["question"] == "e o valor inicial?"
+    assert "Usuário: o que é useState?" in records.planner_calls[1]["history"]
+    assert records.retriever.calls == [["o que é useState?"], ["useState initial value"]]
+    assert records.rewritten == ["useState initial value"]
 
 
 def test_chat_limpar_resets_history(monkeypatch, settings) -> None:
-    fake_answer, fake_condense, _retriever, _rewritten = _run_chat(
-        monkeypatch, settings, ["primeira", "limpar", "segunda", "sair"]
-    )
+    records = _run_chat(monkeypatch, settings, ["primeira", "limpar", "segunda", "sair"])
 
-    assert [payload["question"] for payload in fake_answer.inputs] == [
+    assert [payload["question"] for payload in records.answer.inputs] == [
         "primeira",
         "segunda",
     ]
-    assert fake_answer.inputs[1]["history"] == []
-    assert fake_condense.calls == []
+    assert records.answer.inputs[1]["history"] == []
+    assert records.planner_calls[-1]["history"] == ""
 
 
 def test_chat_memory_disabled_sends_empty_history(monkeypatch, settings) -> None:
-    test_settings = replace(settings, chat_memory_turns=0)
+    test_settings = replace(settings, chat_memory_turns=0, fanout_enabled=False)
 
-    fake_answer = _FakeAnswerChain()
-    fake_condense = _FakeCondenseChain()
+    records = _run_chat(
+        monkeypatch,
+        settings,
+        ["primeira", "segunda", "sair"],
+        settings_override=test_settings,
+    )
 
-    monkeypatch.setattr(ui, "ask_question", _question_provider(["primeira", "segunda", "sair"]))
-    monkeypatch.setattr(ui, "chat_intro", lambda *args, **kwargs: None)
-    monkeypatch.setattr(ui, "stream_answer", lambda stream: "resposta")
-    monkeypatch.setattr(ui, "print_sources", lambda *args, **kwargs: None)
-    monkeypatch.setattr(ui, "print_rewritten_query", lambda *args: None)
-    monkeypatch.setattr(ui, "print_condense_fallback", lambda: None)
-
-    with (
-        patch.object(cli.Settings, "from_env", return_value=test_settings),
-        patch.object(cli.Retriever, "build", return_value=_FakeRetriever()),
-        patch.object(cli, "build_answer_chain", return_value=fake_answer),
-        patch.object(cli, "build_condense_chain", return_value=fake_condense),
-    ):
-        cli.chat(k=None, show_chunks=False, debug=False)
-
-    assert [payload["history"] for payload in fake_answer.inputs] == [[], []]
-    assert fake_condense.calls == []
+    assert [payload["history"] for payload in records.answer.inputs] == [[], []]
+    assert records.planner_calls == []
+    assert records.retriever.calls == [["primeira"], ["segunda"]]
 
 
-def test_chat_condense_failure_falls_back_to_original(monkeypatch, settings) -> None:
-    import openai
+def test_chat_planner_failure_falls_back_to_original(monkeypatch, settings) -> None:
+    records = _run_chat(
+        monkeypatch,
+        settings,
+        ["primeira", "segunda", "sair"],
+        planner_error=True,
+    )
 
-    class _FailingCondense:
-        def invoke(self, payload: dict) -> str:
-            raise openai.APIConnectionError(request=None)  # type: ignore[arg-type]
-
-    fake_answer = _FakeAnswerChain()
-    fake_retriever = _FakeRetriever()
-    fallbacks: list[bool] = []
-
-    monkeypatch.setattr(ui, "ask_question", _question_provider(["primeira", "segunda", "sair"]))
-    monkeypatch.setattr(ui, "chat_intro", lambda *args, **kwargs: None)
-    monkeypatch.setattr(ui, "stream_answer", lambda stream: "resposta")
-    monkeypatch.setattr(ui, "print_sources", lambda *args, **kwargs: None)
-    monkeypatch.setattr(ui, "print_rewritten_query", lambda *args: None)
-    monkeypatch.setattr(ui, "print_condense_fallback", lambda: fallbacks.append(True))
-
-    with (
-        patch.object(cli.Settings, "from_env", return_value=settings),
-        patch.object(cli.Retriever, "build", return_value=fake_retriever),
-        patch.object(cli, "build_answer_chain", return_value=fake_answer),
-        patch.object(cli, "build_condense_chain", return_value=_FailingCondense()),
-    ):
-        cli.chat(k=None, show_chunks=False, debug=False)
-
-    assert fake_retriever.queries == ["primeira", "segunda"]
-    assert fallbacks == [True]
-    assert len(fake_answer.inputs) == 2
-
-
-class _EmptyRetriever:
-    hybrid_enabled = False
-    document_count = 0
-
-    def retrieve(self, query: str) -> list[RetrievedChunk]:
-        return []
+    assert records.retriever.calls == [["primeira"], ["segunda"]]
+    assert records.fallbacks == 2
+    assert len(records.answer.inputs) == 2
 
 
 def test_chat_without_chunks_answers_with_general_knowledge(monkeypatch, settings) -> None:
-    fake_answer = _FakeAnswerChain()
-    fake_condense = _FakeCondenseChain()
-    warnings: list[tuple[str, int]] = []
+    records = _Records()
+    records.retriever = _FakeRetriever(chunks=[])
+    records.retriever.document_count = 0
+    records = _run_chat(monkeypatch, settings, ["pergunta", "sair"], records=records)
 
-    monkeypatch.setattr(ui, "ask_question", _question_provider(["pergunta", "sair"]))
-    monkeypatch.setattr(ui, "chat_intro", lambda *args, **kwargs: None)
-    monkeypatch.setattr(ui, "stream_answer", lambda stream: "resposta")
-    monkeypatch.setattr(ui, "print_sources", lambda *args, **kwargs: None)
-    monkeypatch.setattr(ui, "print_rewritten_query", lambda *args: None)
-    monkeypatch.setattr(ui, "print_condense_fallback", lambda: None)
-    monkeypatch.setattr(
-        ui, "print_no_results", lambda question, count: warnings.append((question, count))
+    assert records.no_results == [("pergunta", 0)]
+    assert len(records.answer.inputs) == 1
+    assert records.answer.inputs[0]["context"] == "(nenhum trecho recuperado)"
+    assert records.answer.inputs[0]["question"] == "pergunta"
+
+
+def test_chat_fanout_passes_multiple_queries(monkeypatch, settings) -> None:
+    records = _run_chat(
+        monkeypatch,
+        settings,
+        ["como funciona useMemo e useCallback?", "sair"],
+        plan=lambda question, history: [
+            "useMemo vs useCallback",
+            "useMemo performance",
+            "useCallback dependencies",
+        ],
     )
 
-    with (
-        patch.object(cli.Settings, "from_env", return_value=settings),
-        patch.object(cli.Retriever, "build", return_value=_EmptyRetriever()),
-        patch.object(cli, "build_answer_chain", return_value=fake_answer),
-        patch.object(cli, "build_condense_chain", return_value=fake_condense),
-    ):
-        cli.chat(k=None, show_chunks=False, debug=False)
+    assert records.retriever.calls == [
+        ["useMemo vs useCallback", "useMemo performance", "useCallback dependencies"]
+    ]
+    assert records.printed_queries == [
+        ["useMemo vs useCallback", "useMemo performance", "useCallback dependencies"]
+    ]
+    assert records.answer.inputs[0]["question"] == "como funciona useMemo e useCallback?"
 
-    assert warnings == [("pergunta", 0)]
-    assert len(fake_answer.inputs) == 1
-    assert fake_answer.inputs[0]["context"] == "(nenhum trecho recuperado)"
-    assert fake_answer.inputs[0]["question"] == "pergunta"
+
+def test_chat_fanout_disabled_condenses_only_with_history(monkeypatch, settings) -> None:
+    test_settings = replace(settings, fanout_enabled=False)
+
+    records = _run_chat(
+        monkeypatch,
+        settings,
+        ["primeira", "e a segunda?", "sair"],
+        settings_override=test_settings,
+        plan=lambda question, history: ["condensed second"] if history else [question],
+    )
+
+    assert records.retriever.calls == [["primeira"], ["condensed second"]]
+    assert len(records.planner_calls) == 1
+    assert records.planner_calls[0]["max_queries"] == 1
+
+
+def test_chat_gap_filling_adds_queries_and_refetches(monkeypatch, settings) -> None:
+    verdicts = iter(
+        [
+            SufficiencyResult(
+                sufficient=False,
+                missing="faltou o comportamento de cleanup",
+                queries=["useEffect cleanup timing"],
+            ),
+            SufficiencyResult(sufficient=True, missing="", queries=[]),
+        ]
+    )
+
+    records = _run_chat(
+        monkeypatch,
+        settings,
+        ["como o useEffect funciona?", "sair"],
+        plan=lambda question, history: ["useEffect"],
+        sufficiency=lambda question, history, chunks: next(verdicts),
+    )
+
+    assert records.retriever.calls == [
+        ["useEffect"],
+        ["useEffect", "useEffect cleanup timing"],
+    ]
+    assert records.gaps == [("faltou o comportamento de cleanup", ["useEffect cleanup timing"])]
+    assert len(records.check_calls) == 1
+    assert records.printed_queries[-1] == [
+        "useEffect",
+        "useEffect cleanup timing",
+    ]
+
+
+def test_chat_sufficiency_disabled_skips_check(monkeypatch, settings) -> None:
+    records = _run_chat(
+        monkeypatch,
+        settings,
+        ["pergunta", "sair"],
+        settings_override=replace(settings, sufficiency_max_rounds=0),
+    )
+
+    assert records.check_calls == []
+    assert records.retriever.calls == [["pergunta"]]
+
+
+def test_chat_sufficiency_failure_falls_back(monkeypatch, settings) -> None:
+    records = _run_chat(
+        monkeypatch,
+        settings,
+        ["primeira", "segunda", "sair"],
+        sufficiency_error=True,
+    )
+
+    assert records.sufficiency_fallbacks == 2
+    assert records.retriever.calls == [["primeira"], ["segunda"]]
+    assert len(records.answer.inputs) == 2

@@ -90,3 +90,66 @@ def test_citation_link_scheme_rejects_invalid_value(
     monkeypatch.setenv("CITATION_LINK_SCHEME", "emacs")
     with pytest.raises(SettingsError):
         Settings.from_env()
+
+
+def test_fanout_defaults(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    for name in (
+        "FANOUT_ENABLED",
+        "FANOUT_MAX_QUERIES",
+        "FANOUT_CANDIDATES_PER_QUERY",
+        "FANOUT_QUERY_LANGUAGE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    settings = Settings.from_env(env_file=tmp_path / "none.env")
+    assert settings.fanout_enabled is True
+    assert settings.fanout_max_queries == 3
+    assert settings.fanout_candidates_per_query == 8
+    assert settings.fanout_query_language == "en"
+
+
+def test_fanout_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FANOUT_ENABLED", "false")
+    monkeypatch.setenv("FANOUT_MAX_QUERIES", "4")
+    monkeypatch.setenv("FANOUT_QUERY_LANGUAGE", "auto")
+    settings = Settings.from_env()
+    assert settings.fanout_enabled is False
+    assert settings.fanout_max_queries == 4
+    assert settings.fanout_query_language == "auto"
+
+
+def test_fanout_max_queries_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FANOUT_MAX_QUERIES", "0")
+    with pytest.raises(SettingsError):
+        Settings.from_env()
+    monkeypatch.setenv("FANOUT_MAX_QUERIES", "7")
+    with pytest.raises(SettingsError):
+        Settings.from_env()
+
+
+def test_fanout_language_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FANOUT_QUERY_LANGUAGE", "pt")
+    with pytest.raises(SettingsError):
+        Settings.from_env()
+
+
+def test_sufficiency_defaults(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    monkeypatch.delenv("SUFFICIENCY_MAX_ROUNDS", raising=False)
+    monkeypatch.delenv("SUFFICIENCY_MAX_GAP_QUERIES", raising=False)
+    settings = Settings.from_env(env_file=tmp_path / "none.env")
+    assert settings.sufficiency_max_rounds == 1
+    assert settings.sufficiency_max_gap_queries == 2
+
+
+def test_sufficiency_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SUFFICIENCY_MAX_ROUNDS", "0")
+    assert Settings.from_env().sufficiency_max_rounds == 0
+
+
+def test_sufficiency_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SUFFICIENCY_MAX_ROUNDS", "-1")
+    with pytest.raises(SettingsError):
+        Settings.from_env()
+    monkeypatch.setenv("SUFFICIENCY_MAX_ROUNDS", "1")
+    monkeypatch.setenv("SUFFICIENCY_MAX_GAP_QUERIES", "0")
+    with pytest.raises(SettingsError):
+        Settings.from_env()

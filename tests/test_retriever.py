@@ -75,3 +75,49 @@ def test_retrieve_respects_k(settings, fake_embeddings) -> None:
     results = retriever.retrieve("rental contract or cat")
 
     assert len(results) <= settings.retrieval_k
+
+
+def test_retrieve_many_fuses_queries_and_tracks_provenance(settings, fake_embeddings) -> None:
+    store, documents = make_store(settings, fake_embeddings)
+    corpus = [tokenize_en(document.page_content) for document in documents]
+    retriever = Retriever(
+        store=store,
+        settings=settings,
+        documents=documents,
+        bm25=BM25Plus(corpus),
+    )
+
+    results = retriever.retrieve_many(["rental contract", "cat window"])
+
+    ids = {chunk.document.metadata["doc_id"] for chunk in results}
+    assert ids == {"a", "b"}
+    assert all(chunk.queries for chunk in results)
+    by_id = {chunk.document.metadata["doc_id"]: chunk for chunk in results}
+    assert "rental contract" in by_id["a"].queries
+    assert "cat window" in by_id["b"].queries
+
+
+def test_retrieve_many_dedupes_repeated_queries(settings, fake_embeddings) -> None:
+    store, documents = make_store(settings, fake_embeddings)
+    corpus = [tokenize_en(document.page_content) for document in documents]
+    retriever = Retriever(
+        store=store,
+        settings=settings,
+        documents=documents,
+        bm25=BM25Plus(corpus),
+    )
+
+    results = retriever.retrieve_many(["cat", "CAT", "cat"])
+
+    assert [chunk.document.metadata["doc_id"] for chunk in results] == [
+        chunk.document.metadata["doc_id"] for chunk in retriever.retrieve("cat")
+    ]
+    assert all(chunk.queries == ("cat",) for chunk in results)
+
+
+def test_retrieve_many_empty_queries(settings, fake_embeddings) -> None:
+    store, documents = make_store(settings, fake_embeddings)
+    retriever = Retriever(store=store, settings=settings, documents=documents, bm25=None)
+
+    assert retriever.retrieve_many([]) == []
+    assert retriever.retrieve_many(["   "]) == []

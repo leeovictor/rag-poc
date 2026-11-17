@@ -42,10 +42,12 @@ flowchart TB
     IX --> EM["clients.py<br/>gera embeddings no OpenRouter"]
     EM --> IDX[("faiss_index/<br/>index.faiss + index.pkl + manifest.json")]
 
-    M --> CN["chain.py<br/>reformula o follow-up"]
-    CN --> RT["retriever.py<br/>busca híbrida"]
+    M --> CN["chain.py<br/>planeja consultas (fan-out)"]
+    CN --> RT["retriever.py<br/>busca híbrida 1..N"]
     IDX -.->|"carrega na memória"| RT
-    RT --> PR["chain.py<br/>prompt anti-alucinação"]
+    RT --> SF["chain.py<br/>checa suficiência"]
+    SF -->|"insuficiente"| RT
+    SF -->|"ok"| PR["chain.py<br/>prompt anti-alucinação"]
     PR --> LLM["LLM no OpenRouter<br/>gpt-4o-mini"]
     LLM --> UI["ui.py<br/>streaming + fontes clicáveis"]
     UI --> M
@@ -58,8 +60,9 @@ INGEST
   arquivos -> leitura -> chunks -> embeddings -> índice em disco
 
 CHAT
-  pergunta -> memória -> reformulação -> busca híbrida -> prompt -> LLM
-           -> resposta no terminal + tabela de fontes -> memória
+  pergunta -> memória -> planner (1..N consultas) -> busca híbrida
+           -> fusão RRF -> suficiência? -> (busca extra) -> prompt -> LLM
+           -> resposta + fontes -> memória
 ```
 
 ---
@@ -78,7 +81,7 @@ peças sem quebrar o resto.
 | `clients.py` | Fala com o OpenRouter (chat e embeddings) | Telefone |
 | `tokenizer.py` | Prepara palavras para a busca por termos (inglês) | Índice remissivo |
 | `retriever.py` | Busca vetorial + busca por palavras e funde resultados | Dois bibliotecários + um juiz |
-| `chain.py` | Prompts, reformulação de pergunta e pipeline do LLM | Roteiro do bibliotecário |
+| `chain.py` | Prompts, fan-out, suficiência e pipeline do LLM | Roteiro do bibliotecário |
 | `memory.py` | Guarda os últimos turnos da conversa | Bloco de notas |
 | `ui.py` | Desenha tudo no terminal (cores, tabelas, streaming) | Vitrine |
 | `links.py` | Cria links clicáveis para abrir a fonte | Atalhos |
@@ -160,12 +163,17 @@ por `doc_id` e devolve os `k` melhores trechos. Cada trecho carrega a marca
 
 ### 3.8 `chain.py` — o roteiro
 
-Contém três pipelines:
+Contém quatro pipelines:
 
 - **Prompt de resposta**: regras de fidelidade/citação + histórico + contexto
   recuperado + pergunta.
-- **Reformulação**: transforma um follow-up ("e o cleanup?") em uma consulta
-  autônoma usando o histórico.
+- **Planejamento/fan-out**: usa o histórico para reescrever o follow-up e
+  decompor perguntas compostas em 1..`FANOUT_MAX_QUERIES` consultas de busca.
+  A saída é um JSON com a chave `queries`; a primeira consulta é a pergunta
+  principal reescrita e as demais cobrem subtópicos.
+- **Suficiência**: recebe a pergunta + contexto recuperado e devolve um JSON
+  com `sufficient`, `missing` e consultas de lacuna. Se o contexto não bastar,
+  essas consultas disparam uma rodada extra de busca.
 - **Cadeia LCEL**: `prompt | llm | StrOutputParser()`, que é literalmente uma
   linha de montagem: prompt entra, LLM processa, parser devolve texto.
 
@@ -196,7 +204,7 @@ Desenha no terminal:
 - spinners enquanto busca/gera;
 - resposta em Markdown, atualizada token a token com `Live`;
 - tabela de fontes com página, origem da busca e se foi citada;
-- links clicáveis (OSC 8) no nome do arquivo.
+- links clicáveis (OSC 8) no nome do arquivo e nas citações `[n]`.
 
 ### 3.11 `links.py` — os atalhos
 
@@ -319,22 +327,35 @@ sequenceDiagram
 
     U->>CLI: pergunta
     CLI->>M: últimos turnos
-    alt há histórico
-        CLI->>C: reformular follow-up
+    alt fan-out ligado ou há histórico
+        CLI->>C: planejar consultas (histórico + pergunta)
         C->>L: chamada curta
-        L-->>C: consulta autônoma
-        C-->>CLI: consulta de busca
-    else primeira pergunta
+        L-->>C: JSON com 1..N consultas
+        C-->>CLI: lista de consultas
+    else sem histórico e fan-out desligado
         CLI->>CLI: usa a pergunta original
     end
 
-    CLI->>R: retrieve(consulta)
-    R->>V: embedding + top-k vetorial
-    R->>B: top-k por palavras
-    V-->>R: chunks
-    B-->>R: chunks
-    R->>R: funde por RRF e deduplica
-    R-->>CLI: até k chunks
+    loop para cada consulta
+        CLI->>R: retrieve(consulta)
+        R->>V: embedding + top-k vetorial
+        R->>B: top-k por palavras
+        V-->>R: chunks
+        B-->>R: chunks
+        R->>R: funde por RRF e deduplica
+    end
+    R->>R: novo RRF entre as consultas -> top k
+    R-->>CLI: até k chunks com proveniência
+
+    alt suficiência ligada e há chunks
+        CLI->>C: avaliar suficiência (pergunta + contexto)
+        C->>L: chamada curta
+        L-->>C: JSON { sufficient, missing, queries }
+        opt insufficient
+            CLI->>R: retrieve_many(consultas + lacunas)
+            R-->>CLI: contexto ampliado
+        end
+    end
 
     CLI->>C: prompt (histórico + contexto + pergunta)
     C->>L: streaming
@@ -344,24 +365,31 @@ sequenceDiagram
     CLI->>M: salva o turno
 ```
 
-### 6.1 Por que existe a reformulação?
+### 6.1 Planejamento e fan-out
 
-Perguntas de acompanhamento usam pronomes e elipses:
+O planner resolve dois problemas de uma vez:
 
-```text
-Turno 1: "How does useEffect cleanup work?"
-Turno 2: "When does it run?"
+1. **Reescrita de follow-up**: "When does it run?" vira uma pergunta autônoma
+   usando o histórico ("When does the useEffect cleanup function run?").
+2. **Decomposição**: perguntas compostas viram várias consultas. Por exemplo,
+   "qual a diferença entre useMemo e useCallback e quando usar cada um?" pode
+   gerar:
+
+```json
+{"queries": [
+  "difference between useMemo and useCallback",
+  "when to use useMemo",
+  "when to use useCallback dependencies"
+]}
 ```
 
-Se a busca usar "When does it run?" literalmente, ela não encontra nada útil.
-A chain de reformulação lê o histórico e produz algo como:
+A primeira consulta é a principal; as outras cobrem subtópicos, até
+`FANOUT_MAX_QUERIES`. A resposta e as citações continuam ligadas à pergunta
+original. Se o planner falhar ou devolver formato inválido, a CLI usa a
+pergunta original (com aviso).
 
-```text
-"useEffect cleanup function execution timing"
-```
-
-A busca usa a versão reescrita; a resposta e as citações continuam ligadas à
-pergunta original. Se a reformulação falhar, a CLI usa a pergunta original.
+Com `FANOUT_ENABLED=false`, o planner ainda é usado para reescrever follow-ups,
+mas limitado a 1 consulta.
 
 ### 6.2 Como as duas buscas são fundidas (RRF)
 
@@ -376,6 +404,11 @@ Exemplo com pesos `0,5 / 0,5` e constante 60:
 B vence porque aparece bem colocado nos **dois** rankings. Essa é a ideia do
 RRF: recompensar consenso sem precisar comparar escalas diferentes.
 
+Com fan-out, o mesmo RRF é aplicado **duas vezes**: dentro de cada consulta
+(vetor + BM25) e depois entre as listas das várias consultas. Um documento que
+aparece bem em consultas diferentes sobe no ranking final. A tabela de fontes
+mostra em quantas subconsultas cada trecho foi recuperado.
+
 ### 6.3 Se nenhum trecho for recuperado
 
 A CLI avisa que a busca não encontrou nada e ainda chama o LLM, passando um
@@ -387,9 +420,40 @@ pergunta com termos que apareçam nelas.
 ### 6.4 Como a resposta é exibida
 
 - streaming token a token em Markdown;
-- citações `[n]` no texto;
+- citações `[n]` clicáveis (abrem o arquivo da fonte no VSCode/app padrão);
 - tabela de fontes com arquivo clicável, página (PDF), origem (`vetor`,
-  `bm25`, ambos) e se foi citada.
+  `bm25`, ambos), subconsultas e se foi citada.
+
+### 6.5 Loop de suficiência
+
+Inspirado no "checks its work" do Google: depois da busca inicial, um LLM
+avalia se o contexto basta para responder.
+
+```text
+contexto inicial
+      │
+      ▼
+  suficiência? ── suficiente ──► resposta
+      │
+   insuficiente
+      │
+      ▼
+  consultas de lacuna (até SUFFICIENCY_MAX_GAP_QUERIES)
+      │
+      ▼
+  nova busca + fusão RRF
+      │
+      ▼
+  resposta (máx. SUFFICIENCY_MAX_ROUNDS rodadas)
+```
+
+- `SUFFICIENCY_MAX_ROUNDS=0` desliga o loop.
+- Formato inválido na avaliação é tratado como "suficiente" para não arriscar
+  loops e custo.
+- Falha de API na avaliação não bloqueia a resposta: segue com o contexto
+  atual.
+- A resposta e a memória continuam usando a pergunta original; as consultas de
+  lacuna só ampliam o contexto.
 
 ---
 
@@ -420,6 +484,12 @@ Consequências:
 | `HYBRID_SEARCH` | Liga/desliga o BM25 |
 | `HYBRID_WEIGHTS` | Peso de vetorial vs. lexical |
 | `RETRIEVAL_K` | Quantos trechos entram no contexto |
+| `FANOUT_ENABLED` | Liga/desliga a decomposição em várias consultas |
+| `FANOUT_MAX_QUERIES` | Máximo de consultas por pergunta (1–6) |
+| `FANOUT_CANDIDATES_PER_QUERY` | Candidatos por consulta antes da fusão |
+| `FANOUT_QUERY_LANGUAGE` | Idioma das consultas (`en`/`auto`) |
+| `SUFFICIENCY_MAX_ROUNDS` | Rodadas extras de busca (`0` desliga) |
+| `SUFFICIENCY_MAX_GAP_QUERIES` | Máximo de consultas de lacuna por rodada |
 | `CHAT_MEMORY_TURNS` | Quantos turnos o chat lembra (`0` desativa) |
 | `TEMPERATURE` | `0` = mais determinístico; >0 = mais variado |
 | `CITATION_LINK_SCHEME` | `vscode`, `file` ou `none` |
@@ -449,7 +519,10 @@ Com o corpus atual das docs do React (~5.239 chunks):
 
 - ingestão completa: **~US$ 0,02** e 2–4 minutos de embeddings;
 - pergunta com `k=4`: **~US$ 0,0003**;
-- reformulação de follow-up: alguns centésimos de milésimo de dólar.
+- planner/fan-out: ~US$ 0,0001 por turno (1 chamada curta); cada consulta
+  extra gera só um embedding de query, sem custo relevante;
+- avaliação de suficiência: ~US$ 0,0001 por turno; a rodada extra de busca
+  custa apenas embeddings de consulta.
 
 O `--dry-run` calcula isso para qualquer pasta antes de gastar.
 
@@ -465,6 +538,10 @@ O `--dry-run` calcula isso para qualquer pasta antes de gastar.
   veio do contexto, mas o complemento de conhecimento geral pode estar
   desatualizado ou incorreto.
 - Sem reranking dedicado (cross-encoder); a fusão é RRF.
+- Fan-out melhora cobertura de perguntas compostas, mas não resolve consultas
+  sem sentido; sem gate/reranker, a busca vetorial sempre devolve vizinhos.
+- O loop de suficiência tem no máximo `SUFFICIENCY_MAX_ROUNDS` rodadas; ele
+  melhora contexto parcial, mas não substitui um gate/reranker.
 
 ---
 
@@ -479,14 +556,14 @@ src/rag_poc/
   clients.py      clientes OpenRouter
   tokenizer.py    stopwords + stemming (inglês)
   retriever.py    FAISS + BM25 + RRF
-  chain.py        prompts, reformulação e LCEL
+  chain.py        prompts, planner/fan-out e LCEL
   memory.py       histórico da conversa
-  ui.py           terminal (Rich)
+  ui.py           terminal (Rich), streaming e citações linkadas
   links.py        links vscode/file
   estimation.py   tokens, custo e tempo
   errors.py       exceções amigáveis
 
-tests/            70 testes com embeddings falsos
+tests/            103 testes com embeddings falsos
 docs/ARQUITETURA.md  este documento
 ```
 
@@ -509,6 +586,7 @@ docs/ARQUITETURA.md  este documento
 | **Token** | Unidade de texto que o modelo cobra/processa (~4 caracteres) |
 | **Streaming** | Receber a resposta em pedaços, em vez de esperar tudo |
 | **Grounding** | Manter a resposta apoiada nos documentos |
+| **Suficiência** | Avaliação se o contexto recuperado basta para responder |
 | **Alucinação** | Quando o modelo inventa informação |
 | **Manifest** | Arquivo que descreve o índice (modelo, dimensões, contagem) |
 | **Idempotente** | Repetir a operação não duplica resultados |

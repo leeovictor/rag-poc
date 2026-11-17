@@ -24,10 +24,13 @@ from . import estimation, indexer, loaders, ui
 from .chain import (
     EMPTY_CONTEXT_PLACEHOLDER,
     build_answer_chain,
-    build_condense_chain,
-    condense_question,
+    build_planner_chain,
+    build_sufficiency_chain,
+    check_sufficiency,
     extract_citations,
     format_context,
+    merge_queries,
+    plan_queries,
 )
 from .clients import build_embeddings
 from .config import Settings
@@ -266,12 +269,14 @@ def chat(
     if k is not None:
         settings = replace(settings, retrieval_k=k)
 
+    max_queries = settings.fanout_max_queries if settings.fanout_enabled else 1
     with ui.console.status(
         "[bold cyan]Carregando índice e preparando a busca híbrida...[/]", spinner="dots"
     ):
         retriever = Retriever.build(settings)
         chain = build_answer_chain(settings)
-        condense_chain = build_condense_chain(settings)
+        planner_chain = build_planner_chain(settings, max_queries=max_queries)
+        sufficiency_chain = build_sufficiency_chain(settings)
 
     memory = ConversationMemory(settings.chat_memory_turns)
     ui.chat_intro(settings, hybrid_enabled=retriever.hybrid_enabled)
@@ -294,21 +299,60 @@ def chat(
 
         started = time.perf_counter()
         try:
-            condense_failed = False
-            with ui.console.status("[bold cyan]Buscando trechos relevantes...[/]", spinner="dots"):
-                search_query = question
-                if memory.turn_count > 0:
+            planner_failed = False
+            sufficiency_failed = False
+            gap_events: list[tuple[str, list[str]]] = []
+            needs_plan = memory.turn_count > 0 or (settings.fanout_enabled and max_queries > 1)
+            with ui.console.status(
+                "[bold cyan]Planejando consultas e buscando trechos...[/]", spinner="dots"
+            ):
+                queries = [question]
+                if needs_plan:
                     try:
-                        search_query = condense_question(condense_chain, question, memory.as_text())
+                        queries = plan_queries(
+                            planner_chain, question, memory.as_text(), max_queries
+                        )
                     except openai.OpenAIError:
-                        condense_failed = True
-                        search_query = question
-                chunks = retriever.retrieve(search_query)
+                        planner_failed = True
+                        queries = [question]
+                if not queries:
+                    queries = [question]
+                chunks = retriever.retrieve_many(queries)
 
-            if condense_failed:
-                ui.print_condense_fallback()
-            if search_query.strip() != question.strip():
-                ui.print_rewritten_query(search_query)
+                rounds = 0
+                while (
+                    settings.sufficiency_max_rounds > 0
+                    and rounds < settings.sufficiency_max_rounds
+                    and chunks
+                ):
+                    try:
+                        verdict = check_sufficiency(
+                            sufficiency_chain,
+                            question,
+                            memory.as_text(),
+                            chunks,
+                            settings.sufficiency_max_gap_queries,
+                        )
+                    except openai.OpenAIError:
+                        sufficiency_failed = True
+                        break
+                    if verdict.sufficient or not verdict.queries:
+                        break
+                    gap_events.append((verdict.missing, verdict.queries))
+                    queries = merge_queries(queries, verdict.queries)
+                    chunks = retriever.retrieve_many(queries)
+                    rounds += 1
+
+            if planner_failed:
+                ui.print_planner_fallback()
+            if sufficiency_failed:
+                ui.print_sufficiency_fallback()
+            for missing, gap_queries in gap_events:
+                ui.print_gap(missing, gap_queries)
+            if len(queries) > 1:
+                ui.print_queries(queries)
+            elif queries[0].strip() != question.strip():
+                ui.print_rewritten_query(queries[0])
 
             if not chunks:
                 ui.print_no_results(question, retriever.document_count)
@@ -325,7 +369,9 @@ def chat(
                         "context": format_context(chunks) or EMPTY_CONTEXT_PLACEHOLDER,
                         "question": question,
                     }
-                )
+                ),
+                chunks=chunks,
+                link_scheme=settings.citation_link_scheme,
             )
             memory.add_turn(question, answer)
             cited = extract_citations(answer, len(chunks))
