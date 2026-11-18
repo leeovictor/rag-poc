@@ -1,4 +1,4 @@
-# RAG Híbrido (PoC)
+# RAG (PoC)
 
 CLI de RAG que indexa PDFs, TXTs e Markdown/MDX em um índice FAISS local,
 combina busca vetorial com BM25 e responde perguntas citando as fontes.
